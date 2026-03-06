@@ -326,7 +326,6 @@ class StereoHumanDataset(Dataset):
             img = 2 * (img / 255.0) - 1.0
             mask = torch.from_numpy(stereo_data[mask_view]).permute(2, 0, 1).float()
             mask = mask / 255.0
-
             img = img * mask
             mask[mask < 0.5] = 0.0
             mask[mask >= 0.5] = 1.0

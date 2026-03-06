@@ -61,9 +61,13 @@ class RtStereoHumanModel(nn.Module):
 
             return data, flow_loss, metrics
 
-    def flow2gsparms(self, lr_img, lr_img_feat, data, bs):
+    def flow2gsparms(self, lr_img, lr_img_feat, data, bs, override_depth=None):
         for view in ['lmain', 'rmain']:
-            data[view]['depth'] = flow2depth(data[view])
+            if override_depth != None:
+                data[view]['depth'] = override_depth[view]
+            else:
+                data[view]['depth'] = flow2depth(data[view])
+
             data[view]['xyz'] = depth2pc(data[view]['depth'], data[view]['extr'], data[view]['intr']).view(bs, -1, 3)
             valid = data[view]['depth'] != 0.0
             data[view]['pts_valid'] = valid.view(bs, -1)

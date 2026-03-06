@@ -18,6 +18,10 @@ import torch
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
+import matplotlib.pyplot as plt
+import torch.nn.functional as F
+from torch.cuda.amp import autocast as autocast
+
 
 class StereoHumanRender:
     def __init__(self, cfg_file, phase):
@@ -35,7 +39,7 @@ class StereoHumanRender:
         cv2.cuda.setDevice(0)
         nvof = cv2.cuda.NvidiaOpticalFlow_2_0.create(
             imageSize=(1024, 1024),   # (width, height)
-            perfPreset=cv2.cuda.NvidiaOpticalFlow_2_0_NV_OF_PERF_LEVEL_FAST,
+            perfPreset=cv2.cuda.NvidiaOpticalFlow_2_0_NV_OF_PERF_LEVEL_SLOW,
             enableTemporalHints=False,
             enableExternalHints=False,
             enableCostBuffer=False,
@@ -55,17 +59,81 @@ class StereoHumanRender:
             data = self.fetch_data(item)
             data = get_novel_calib(data, self.cfg.dataset, ratio=ratio, intr_key='intr_ori', extr_key='extr_ori')
             with torch.no_grad():
+                bs = data['lmain']['img'].shape[0]
+                image = torch.cat([data['lmain']['img'], data['rmain']['img']], dim=0)
+
+                with autocast(enabled=self.cfg.raft.mixed_precision):
+                    img_feat = self.model.img_encoder(image)
+
                 if idx % interp_frame_count == 0: # this is the first frame, store the depth and image results
-                    print("store on frame 1?")
-                    data, _, _ = self.model(data, is_train=False)
+                    flow_up = self.model.raft_stereo(img_feat[2], iters=self.model.val_iters, test_mode=True)
+                    data['lmain']['flow_pred'] = flow_up[0]
+                    data['rmain']['flow_pred'] = flow_up[1]
+                    self.model.flow2gsparms(image, img_feat, data, bs)
                     previous_frame_image_l = data['lmain']['grayscale'].contiguous()
                     previous_frame_depth_l = data['lmain']['depth']
                     previous_frame_image_r = data['rmain']['grayscale'].contiguous()
                     previous_frame_depth_r = data['rmain']['depth']
                 else: # interpolation frames
-                    flow_l = self.find_opt_flow(nvof, previous_frame_image_l, data['lmain']['grayscale'])
-                    flow_r = self.find_opt_flow(nvof, previous_frame_image_r, data['rmain']['grayscale'])
-                    data, _, _ = self.model(data, is_train=False)
+                    # (1024, 1024, 2)
+                    flow_l = self.find_opt_flow(nvof, data['lmain']['grayscale'][0], previous_frame_image_l[0])
+                    flow_r = self.find_opt_flow(nvof, data['rmain']['grayscale'][0], previous_frame_image_r[0])
+
+                    flow_l= flow_l.to(torch.float32) / 32.0
+                    flow_r= flow_r.to(torch.float32) / 32.0
+
+                    y_grid_l, x_grid_l = torch.meshgrid(
+                        torch.arange(1024, device=flow_l.device, dtype=torch.float32).cuda(),
+                        torch.arange(1024, device=flow_l.device, dtype=torch.float32).cuda(),
+                        indexing='ij'
+                    )
+
+                    x_grid_l = x_grid_l + flow_l[:, :, 0]
+                    y_grid_l = y_grid_l + flow_l[:, :, 1]
+
+                    x_normalized_l = 2.0 * x_grid_l / (1024 - 1) - 1.0
+                    y_normalized_l = 2.0 * y_grid_l / (1024 - 1) - 1.0
+
+                    grid_l = torch.stack([x_normalized_l, y_normalized_l], dim=-1).unsqueeze(0).type(torch.float32).cuda()
+                    
+                    warped_l = F.grid_sample(
+                        previous_frame_depth_l,
+                        grid_l, 
+                        mode='bilinear', 
+                        padding_mode='zeros',
+                    ).cuda()
+
+                    y_grid_r, x_grid_r = torch.meshgrid(
+                        torch.arange(1024, device=previous_frame_image_r.device, dtype=float).cuda(),
+                        torch.arange(1024, device=previous_frame_image_r.device, dtype=float).cuda(),
+                        indexing='ij'
+                    )
+
+                    x_grid_r = x_grid_r + flow_r[:, :, 0]
+                    y_grid_r = y_grid_r + flow_r[:, :, 1]
+                    x_normalized_r = 2.0 * x_grid_r / (1024 - 1) - 1.0
+                    y_normalized_r = 2.0 * y_grid_r / (1024 - 1) - 1.0
+
+                    grid_r = torch.stack([x_normalized_r, y_normalized_r], dim=-1).unsqueeze(0).type(torch.float32).cuda()
+                    
+                    warped_r = F.grid_sample(
+                        previous_frame_depth_r,
+                        grid_r, 
+                        mode='bilinear', 
+                        padding_mode='zeros',
+                        align_corners=True
+                    )
+
+                    frame_data = self.model.flow2gsparms(
+                        image, 
+                        img_feat, 
+                        data, bs, 
+                        override_depth = {
+                            'lmain': warped_l,
+                            'rmain': warped_r, 
+                        }
+                    )
+                    # data, _, _ = self.model(data, is_train=False)
 
                 data = pts2render(data, bg_color=self.cfg.dataset.bg_color)
 
@@ -82,6 +150,9 @@ class StereoHumanRender:
         for view in ['lmain', 'rmain']:
             for item in data[view].keys():
                 data[view][item] = data[view][item].cuda().unsqueeze(0)
+            # grayscale_mat = cv2.cuda_GpuMat()
+            # grayscale_mat.upload(data[view]['grayscale'])
+            # data[view]['grayscale'] = grayscale_mat
         return data
 
     def load_ckpt(self, load_path):
@@ -92,35 +163,28 @@ class StereoHumanRender:
         logging.info(f"Parameter loading done")
 
     def find_opt_flow(self, nvof, img1, img2):
-        gpumat1 = self.tensor_to_gpumat(img1)
-        gpumat2 = self.tensor_to_gpumat(img2)
-        flow, cost = nvof.calc(gpumat1, gpumat2, None)
+        gpumat1 = cv2.cuda_GpuMat()
+        gpumat1.upload(img1.cpu().numpy())
+        gpumat2 = cv2.cuda_GpuMat()
+        gpumat2.upload(img2.cpu().numpy())
 
+        flow, cost = nvof.calc(gpumat1, gpumat2, None)
         return self.gpumat_to_tensor(flow)
 
-    def tensor_to_gpumat(self, t: torch.Tensor) -> cv2.cuda_GpuMat:
-        assert t.is_cuda, "Tensor must be on GPU"
-        assert t.is_contiguous(), "Tensor must be contiguous"
-        assert t.dtype == torch.uint8, "Expects uint8 for grayscale"
-
-        rows, cols = (t.shape[1], t.shape[2])
-        # step = t.stride(0) * t.element_size()   # bytes per row
-        return cv2.cuda_GpuMat(rows, cols, cv2.CV_8UC1, t.data_ptr())
-    
     def gpumat_to_tensor(self, gpu_mat: cv2.cuda_GpuMat) -> torch.Tensor:
-        h, w = gpu_mat.size()[::-1]
+        h, w = gpu_mat.size()[0], gpu_mat.size()[0]
         c = gpu_mat.channels()
 
         class GpuMatWrapper:
             __cuda_array_interface__ = {
                 "version": 3,
                 "shape": (h, w, c),
-                "typestr": "|u1",  # uint8, change to "<f4" for float32
+                "typestr": "<i2",  # uint8, change to "<f4" for float32
                 "data": (gpu_mat.cudaPtr(), False),
                 "strides": (gpu_mat.step, gpu_mat.elemSize(), gpu_mat.elemSize1()),
             }
 
-        return torch.as_tensor(GpuMatWrapper(), device="cuda")
+        return torch.as_tensor(GpuMatWrapper(), device="cuda").clone()
 
 
 if __name__ == '__main__':
