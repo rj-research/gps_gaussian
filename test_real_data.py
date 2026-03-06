@@ -70,17 +70,17 @@ class StereoHumanRender:
                     data['lmain']['flow_pred'] = flow_up[0]
                     data['rmain']['flow_pred'] = flow_up[1]
                     self.model.flow2gsparms(image, img_feat, data, bs)
-                    previous_frame_image_l = data['lmain']['grayscale'].contiguous()
+                    previous_frame_image_l = data['lmain']['grayscale']
                     previous_frame_depth_l = data['lmain']['depth']
-                    previous_frame_image_r = data['rmain']['grayscale'].contiguous()
+                    previous_frame_image_r = data['rmain']['grayscale']
                     previous_frame_depth_r = data['rmain']['depth']
                 else: # interpolation frames
                     # (1024, 1024, 2)
-                    flow_l = self.find_opt_flow(nvof, data['lmain']['grayscale'][0], previous_frame_image_l[0])
-                    flow_r = self.find_opt_flow(nvof, data['rmain']['grayscale'][0], previous_frame_image_r[0])
+                    flow_l = self.find_opt_flow(nvof, data['lmain']['grayscale'], previous_frame_image_l)
+                    flow_r = self.find_opt_flow(nvof, data['rmain']['grayscale'], previous_frame_image_r)
 
-                    flow_l= flow_l.to(torch.float32) / 32.0
-                    flow_r= flow_r.to(torch.float32) / 32.0
+                    flow_l = flow_l.to(torch.float32) / 32.0
+                    flow_r = flow_r.to(torch.float32) / 32.0
 
                     y_grid_l, x_grid_l = torch.meshgrid(
                         torch.arange(1024, device=flow_l.device, dtype=torch.float32).cuda(),
@@ -104,8 +104,8 @@ class StereoHumanRender:
                     ).cuda()
 
                     y_grid_r, x_grid_r = torch.meshgrid(
-                        torch.arange(1024, device=previous_frame_image_r.device, dtype=float).cuda(),
-                        torch.arange(1024, device=previous_frame_image_r.device, dtype=float).cuda(),
+                        torch.arange(1024, device=flow_r.device, dtype=torch.float32).cuda(),
+                        torch.arange(1024, device=flow_r.device, dtype=torch.float32).cuda(),
                         indexing='ij'
                     )
 
@@ -149,10 +149,12 @@ class StereoHumanRender:
     def fetch_data(self, data):
         for view in ['lmain', 'rmain']:
             for item in data[view].keys():
+                if item == 'grayscale':
+                    continue
                 data[view][item] = data[view][item].cuda().unsqueeze(0)
-            # grayscale_mat = cv2.cuda_GpuMat()
-            # grayscale_mat.upload(data[view]['grayscale'])
-            # data[view]['grayscale'] = grayscale_mat
+            grayscale_mat = cv2.cuda_GpuMat()
+            grayscale_mat.upload(data[view]['grayscale'])
+            data[view]['grayscale'] = grayscale_mat
         return data
 
     def load_ckpt(self, load_path):
@@ -163,12 +165,7 @@ class StereoHumanRender:
         logging.info(f"Parameter loading done")
 
     def find_opt_flow(self, nvof, img1, img2):
-        gpumat1 = cv2.cuda_GpuMat()
-        gpumat1.upload(img1.cpu().numpy())
-        gpumat2 = cv2.cuda_GpuMat()
-        gpumat2.upload(img2.cpu().numpy())
-
-        flow, cost = nvof.calc(gpumat1, gpumat2, None)
+        flow, cost = nvof.calc(img1, img2, None)
         return self.gpumat_to_tensor(flow)
 
     def gpumat_to_tensor(self, gpu_mat: cv2.cuda_GpuMat) -> torch.Tensor:
