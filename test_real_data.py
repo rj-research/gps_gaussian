@@ -58,14 +58,13 @@ class StereoHumanRender:
                 if idx % interp_frame_count == 0: # this is the first frame, store the depth and image results
                     print("store on frame 1?")
                     data, _, _ = self.model(data, is_train=False)
-                    previous_frame_image_l = data['lmain']['img'].contiguous()
+                    previous_frame_image_l = data['lmain']['grayscale'].contiguous()
                     previous_frame_depth_l = data['lmain']['depth']
-                    previous_frame_image_r = data['rmain']['img'].contiguous()
+                    previous_frame_image_r = data['rmain']['grayscale'].contiguous()
                     previous_frame_depth_r = data['rmain']['depth']
                 else: # interpolation frames
-                    print("interpolate")
-                    flow_l = self.find_opt_flow(nvof, previous_frame_image_l, data['lmain']['img'])
-                    flow_r = self.find_opt_flow(nvof, previous_frame_image_r, data['rmain']['img'])
+                    flow_l = self.find_opt_flow(nvof, previous_frame_image_l, data['lmain']['grayscale'])
+                    flow_r = self.find_opt_flow(nvof, previous_frame_image_r, data['rmain']['grayscale'])
                     data, _, _ = self.model(data, is_train=False)
 
                 data = pts2render(data, bg_color=self.cfg.dataset.bg_color)
@@ -103,14 +102,25 @@ class StereoHumanRender:
         assert t.is_cuda, "Tensor must be on GPU"
         assert t.is_contiguous(), "Tensor must be contiguous"
         assert t.dtype == torch.uint8, "Expects uint8 for grayscale"
-    
-        rows, cols = t.shape
+
+        rows, cols = (t.shape[1], t.shape[2])
         # step = t.stride(0) * t.element_size()   # bytes per row
         return cv2.cuda_GpuMat(rows, cols, cv2.CV_8UC1, t.data_ptr())
     
     def gpumat_to_tensor(self, gpu_mat: cv2.cuda_GpuMat) -> torch.Tensor:
-        """Convert cv2.cuda_GpuMat to PyTorch tensor (zero-copy via DLPack)."""
-        return torch.from_dlpack(gpu_mat.toDLpack())
+        h, w = gpu_mat.size()[::-1]
+        c = gpu_mat.channels()
+
+        class GpuMatWrapper:
+            __cuda_array_interface__ = {
+                "version": 3,
+                "shape": (h, w, c),
+                "typestr": "|u1",  # uint8, change to "<f4" for float32
+                "data": (gpu_mat.cudaPtr(), False),
+                "strides": (gpu_mat.step, gpu_mat.elemSize(), gpu_mat.elemSize1()),
+            }
+
+        return torch.as_tensor(GpuMatWrapper(), device="cuda")
 
 
 if __name__ == '__main__':

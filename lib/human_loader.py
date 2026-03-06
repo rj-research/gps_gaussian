@@ -317,8 +317,11 @@ class StereoHumanDataset(Dataset):
         return stereo_data
 
     def stereo_to_dict_tensor(self, stereo_data, subject_name):
-        img_tensor, mask_tensor = [], []
+        img_tensor, mask_tensor, grayscale_tensor = [], [], []
         for (img_view, mask_view) in [('img0', 'mask0'), ('img1', 'mask1')]:
+            original_image = stereo_data[img_view] # (1024, 1024, 3)
+            r, g, b = original_image[:,:,0], original_image[:,:,1], original_image[:,:,2]
+            grayscale = torch.from_numpy(0.2989 * r + 0.5870 * g + 0.1140 * b).to(torch.uint8)
             img = torch.from_numpy(stereo_data[img_view]).permute(2, 0, 1)
             img = 2 * (img / 255.0) - 1.0
             mask = torch.from_numpy(stereo_data[mask_view]).permute(2, 0, 1).float()
@@ -327,10 +330,12 @@ class StereoHumanDataset(Dataset):
             img = img * mask
             mask[mask < 0.5] = 0.0
             mask[mask >= 0.5] = 1.0
+            grayscale_tensor.append(grayscale)
             img_tensor.append(img)
             mask_tensor.append(mask)
 
         lmain_data = {
+            'grayscale': grayscale_tensor[0],
             'img': img_tensor[0],
             'mask': mask_tensor[0],
             'intr': torch.FloatTensor(stereo_data['camera']['intr0']),
@@ -340,6 +345,7 @@ class StereoHumanDataset(Dataset):
         }
 
         rmain_data = {
+            'grayscale': grayscale_tensor[1],
             'img': img_tensor[1],
             'mask': mask_tensor[1],
             'intr': torch.FloatTensor(stereo_data['camera']['intr1']),
